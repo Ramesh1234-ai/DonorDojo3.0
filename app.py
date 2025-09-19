@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 from email.message import EmailMessage
 from firebase_admin import auth, credentials, initialize_app
 import jwt
+from flask_jwt_extended import JWTManager, create_access_token
+from collections.abc import Mapping
+from flask_sqlalchemy import SQLAlchemy
 from database import db, User, Donor, BloodRequest, Donation, ContactMessage, Notification
 import hashlib
 import base64
@@ -14,6 +17,9 @@ from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from flask_session import Session
 from datetime import timedelta
+from models import db, User
+from functools import wraps
+from flask_jwt_extended import jwt_required, get_jwt_identity
 
 # ------------------------- #
 # Load Environment Variables
@@ -22,6 +28,8 @@ load_dotenv()
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
+
+app = Flask(__name__)
 
 # Firebase Admin SDK
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,10 +42,14 @@ initialize_app(cred)
 # ------------------------- #
 # Flask Setup
 # ------------------------- #
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # Backend folder
+TEMPLATES_DIR = os.path.join(BASE_DIR, "..", "Frontend", "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "..", "Frontend", "static")
+
 app = Flask(
     __name__,
-    template_folder='../Frontend/templates',
-    static_folder='../Frontend/static'
+    template_folder=TEMPLATES_DIR,
+    static_folder=STATIC_DIR
 )
 
 # ✅ Use a consistent secret key (NOT random each time)
@@ -63,6 +75,9 @@ CORS(app, supports_credentials=True, origins=[
 
 # ✅ Initialize server-side session
 Session(app)
+jwt = JWTManager(app)
+app.config['SQLALCHEMY_DATABASE_URI'] = "mysql+pymysql://root:root@localhost/blood_ninja"
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 with app.app_context():
@@ -141,9 +156,14 @@ def register():
         db.session.flush()
 
         if new_user.role == 'donor':
-            donor = Donor(id=str(uuid.uuid4()), user_id=new_user.id, blood_type=data.get('blood_type'), is_available=True)
-            db.session.add(donor)
-
+          donor = Donor(
+        id=str(uuid.uuid4()),
+        user_id=new_user.id,
+        blood_type=data.get('blood_type'),
+        is_available=True,
+        status="pending"  # <-- wait for admin approval
+        )
+        db.session.add(donor)
         db.session.commit()
         send_notification(new_user, f"Welcome {new_user.name}! You are registered as {new_user.role}.")
         return jsonify({'message': 'User registered', 'user': {'id': new_user.id, 'email': new_user.email, 'name': new_user.name, 'role': new_user.role}}), 201
@@ -152,47 +172,32 @@ def register():
         return jsonify({'message': f'Registration failed: {e}'}), 500
 #------------------------- #
 # Login Route
-@app.route("/api/auth/login", methods=["POST"])
+@app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.json
-    try:
-        if "idToken" in data:  # Google login
-            decoded_token = auth.verify_id_token(data["idToken"])
-            email = decoded_token["email"]
-            name = decoded_token.get("name", email.split("@")[0])
-            avatar_url = decoded_token.get("picture", "/static/default-avatar.png")
-            role = "admin" if email.endswith("@admin.com") else "user"
+    data = request.get_json()
+    email = data.get('email')  # or username
+    password = data.get('password')
+    
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+    
+    user = User.query.filter_by(email=email).first()
+    
+    if user and check_password_hash(user.password_hash, password):
+        access_token = create_access_token(identity=user.id)
+        return jsonify({
+            'message': 'Login successful',
+            'access_token': access_token,
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'role': user.role
+            }
+        }), 200
+    
+    return jsonify({'error': 'Invalid credentials'}), 401
 
-        elif "email" in data and "password" in data:  # ✅ Manual login
-            email = data["email"]
-            password = data["password"]
-
-            # ✅ Replace with real DB lookup:
-            # user = db.query(User).filter_by(email=email).first()
-            # if not user or not check_password_hash(user.password, password): ...
-            if email == "test@admin.com" and password == "1234":
-                name = "Test Admin"
-                role = "admin"
-                avatar_url = "/static/default-avatar.png"
-            else:
-                return jsonify({"error": "Invalid credentials"}), 401
-
-        else:
-            return jsonify({"error": "Invalid login data"}), 400
-
-        # ✅ Save to session
-        session.permanent = True
-        session["user"] = {
-            "name": name,
-            "email": email,
-            "avatar": avatar_url,
-            "role": role
-        }
-
-        return jsonify({"message": "Login successful", "user": session["user"]})
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 #------------------------- #
 # Firebase Login Route
 @app.route('/api/auth/firebase-login', methods=['POST'])
@@ -337,11 +342,18 @@ def html_alias(name):
     except:
         return ("Not Found", 404)
 
-@app.route('/dashboard')
-def dashboard_page(): return render_template('index.html')
+@app.route("/dashboard")
+def dashboard():
+    return render_template("DashBoard.html")
+
 
 @app.route('/about')
 def about_page(): return render_template('about.html')
+
+@app.route("/adminPanel")
+def adminPanel():
+    return render_template("adminPanel.html")
+
 
 @app.route("/recipient")
 def recipient():
@@ -408,15 +420,152 @@ def protected():
     if "user" not in session:
         return jsonify({"error": "User not logged in"}), 401
     return jsonify({"message": f"Welcome {session['user']}"})
+# ------------------------- #
+@app.route("/auth/register", methods=["POST"])
+def register_donor(): 
+    data = request.json
+    if User.query.filter_by(username=data["username"]).first():
+        return jsonify({"error": "User already exists"}), 400
+    
+    user = User(username=data["username"], role=data["role"])
+    user.set_password(data["password"])
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "User registered successfully"}), 201
 
-@app.route("/api/admin/dashboard")
-def admin_dashboard():
-    user = session.get("user")
-    if not user:
-        return jsonify({"error": "Not logged in"}), 401
-    if user["role"] != "admin":
-        return jsonify({"error": "Access denied"}), 403
-    return jsonify({"message": f"Welcome Admin {user['name']}!"})
+
+@app.route("/auth/login", methods=["POST"])
+def login_donor():
+    data = request.json
+    user = User.query.filter_by(username=data["username"]).first()
+    if not user or not user.check_password(data["password"]):
+        return jsonify({"error": "Invalid credentials"}), 401
+    
+    token = create_access_token(identity={"id": user.id, "role": user.role})
+    return jsonify({"access_token": token, "role": user.role}), 200
+#-------------------------- #
+
+def role_required(role):
+    def wrapper(fn):
+        @wraps(fn)  # ✅ preserves the original function name
+        @jwt_required()
+        def decorated_function(*args, **kwargs):
+            identity = get_jwt_identity()
+            if identity["role"] != role:
+                return jsonify({"error": "Access forbidden"}), 403
+            return fn(*args, **kwargs)
+        return decorated_function
+    return wrapper
+
+@app.route("/donor/profile", methods=["GET"])
+@role_required("donor")
+def donor_profile():
+    return jsonify({"message": "Welcome Donor! Here is your profile."})
+
+@app.route("/recipient/requests", methods=["GET"])
+@role_required("recipient")
+def recipient_requests():
+    return jsonify({"message": "Welcome Recipient! Here are your requests."})
+# ------------------------- #
+@app.route("/auth/login", methods=["POST"])
+def adlogin():
+    # verify username/password
+    access_token = create_access_token(identity={"username": user.username, "role": user.role})
+    
+    # return token + optional redirect URL
+    redirect_url = ""
+    if user.role == "admin":
+        redirect_url = "/admin/dashboard"
+    elif user.role == "donor":
+        redirect_url = "/donor/profile"
+    elif user.role == "recipient":
+        redirect_url = "/recipient/requests"
+    
+    return jsonify({"access_token": access_token, "redirect": redirect_url})
+#------------------------- #
+# Get pending donors
+@app.route("/admin/pending-donors", methods=["GET"])
+@role_required("admin")
+def get_pending_donors():
+    donors = Donor.query.filter_by(status="pending").all()
+    return jsonify([
+        {
+            "id": d.id,
+            "user_id": d.user_id,
+            "blood_type": d.blood_type,
+            "is_available": d.is_available
+        } for d in donors
+    ]), 200
+
+# Approve donor
+@app.route("/admin/approve-donor/<donor_id>", methods=["PUT"])
+@role_required("admin")
+def approve_donor(donor_id):
+    donor = Donor.query.filter_by(id=donor_id, status="pending").first()
+    if not donor:
+        return jsonify({"error": "Donor not found or already processed"}), 404
+    donor.status = "approved"
+    db.session.commit()
+    user = User.query.get(donor.user_id)
+    send_notification(user, f"Your donor registration has been approved!")
+    return jsonify({"message": "Donor approved"}), 200
+
+# Reject donor
+@app.route("/admin/reject-donor/<donor_id>", methods=["DELETE"])
+@role_required("admin")
+def reject_donor(donor_id):
+    donor = Donor.query.filter_by(id=donor_id, status="pending").first()
+    if not donor:
+        return jsonify({"error": "Donor not found or already processed"}), 404
+    donor.status = "rejected"
+    db.session.commit()
+    user = User.query.get(donor.user_id)
+    send_notification(user, f"Your donor registration has been rejected.")
+    return jsonify({"message": "Donor rejected"}), 200
+
+# Get pending blood requests
+@app.route("/admin/pending-requests", methods=["GET"])
+@role_required("admin")
+def get_pending_requests():
+    requests = BloodRequest.query.filter_by(status="pending").all()
+    return jsonify([
+        {
+            "id": r.id,
+            "requester_id": r.requester_id,
+            "blood_type": r.blood_type,
+            "quantity": r.quantity,
+            "urgency": r.urgency,
+            "hospital": r.hospital,
+            "contact_number": r.contact_number,
+            "notes": r.notes
+        } for r in requests
+    ]), 200
+
+# Approve blood request
+@app.route("/admin/approve-request/<request_id>", methods=["PUT"])
+@role_required("admin")
+def approve_request(request_id):
+    br = BloodRequest.query.filter_by(id=request_id, status="pending").first()
+    if not br:
+        return jsonify({"error": "Request not found or already processed"}), 404
+    br.status = "approved"
+    db.session.commit()
+    user = User.query.get(br.requester_id)
+    send_notification(user, f"Your blood request has been approved!")
+    return jsonify({"message": "Request approved"}), 200
+
+# Reject blood request
+@app.route("/admin/reject-request/<request_id>", methods=["DELETE"])
+@role_required("admin")
+def reject_request(request_id):
+    br = BloodRequest.query.filter_by(id=request_id, status="pending").first()
+    if not br:
+        return jsonify({"error": "Request not found or already processed"}), 404
+    br.status = "rejected"
+    db.session.commit()
+    user = User.query.get(br.requester_id)
+    send_notification(user, f"Your blood request has been rejected.")
+    return jsonify({"message": "Request rejected"}), 200
 
 # ------------------------- #
 if __name__ == '__main__':
