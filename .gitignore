@@ -2,7 +2,5 @@ venv/
 __pycache__/
 *.pyc
 .env
-<<<<<<< HEAD
-=======
 Backend/firebase_config.json
->>>>>>> 297b8874e9caae5b08920afe6a54ec210592d66c
+firebase_config.json
